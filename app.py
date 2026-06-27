@@ -1,9 +1,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import re
+from io import BytesIO
 
 import pandas as pd
 import streamlit as st
+
+try:
+    import pdfplumber
+except ImportError:  # pragma: no cover
+    pdfplumber = None
 
 
 st.set_page_config(page_title="不動産投資シミュレーター", page_icon="🏠", layout="wide")
@@ -88,13 +95,7 @@ def simulate(i: Inputs) -> dict:
         building_management = i.management_monthly * 12
         repair_reserve = i.repair_monthly * 12
         outsource_fee = effective_rent * i.management_outsource_rate / 100
-        running_cost = (
-            building_management
-            + repair_reserve
-            + i.property_city_tax_yearly
-            + outsource_fee
-            + i.restoration_equipment_yearly
-        )
+        running_cost = building_management + repair_reserve + i.property_city_tax_yearly + outsource_fee + i.restoration_equipment_yearly
         loan_payment = interest_paid + principal_paid
         cf_before_tax = effective_rent - running_cost - loan_payment
 
@@ -110,28 +111,26 @@ def simulate(i: Inputs) -> dict:
         total_vacancy_loss += vacancy_loss
         total_outsource_fee += outsource_fee
 
-        rows.append(
-            {
-                "年": year,
-                "満室想定家賃": gross_rent,
-                "空室損失": vacancy_loss,
-                "実効家賃収入": effective_rent,
-                "建物管理費": building_management,
-                "修繕積立金": repair_reserve,
-                "固定資産税・都市計画税": i.property_city_tax_yearly,
-                "管理委託料": outsource_fee,
-                "原状回復・設備交換費": i.restoration_equipment_yearly,
-                "ローン返済": loan_payment,
-                "うち利息": interest_paid,
-                "うち元本": principal_paid,
-                "減価償却": yearly_depreciation,
-                "税務上所得": taxable_income,
-                "税効果": tax_effect,
-                "税前CF": cf_before_tax,
-                "税後CF": cf_after_tax,
-                "ローン残債": balance,
-            }
-        )
+        rows.append({
+            "年": year,
+            "満室想定家賃": gross_rent,
+            "空室損失": vacancy_loss,
+            "実効家賃収入": effective_rent,
+            "建物管理費": building_management,
+            "修繕積立金": repair_reserve,
+            "固定資産税・都市計画税": i.property_city_tax_yearly,
+            "管理委託料": outsource_fee,
+            "原状回復・設備交換費": i.restoration_equipment_yearly,
+            "ローン返済": loan_payment,
+            "うち利息": interest_paid,
+            "うち元本": principal_paid,
+            "減価償却": yearly_depreciation,
+            "税務上所得": taxable_income,
+            "税効果": tax_effect,
+            "税前CF": cf_before_tax,
+            "税後CF": cf_after_tax,
+            "ローン残債": balance,
+        })
 
     sale_cost = i.sale_price * i.sale_cost_rate / 100
     building_book_value = max(building_price - cumulative_depreciation, 0)
@@ -174,25 +173,117 @@ def analyze_holding_years(inputs: Inputs, max_years: int) -> pd.DataFrame:
     records = []
     for year in range(1, max_years + 1):
         result = simulate(replace(inputs, holding_years=year))
-        records.append(
-            {
-                "保有年数": year,
-                "最終利益": result["final_profit"],
-                "運用中CF": result["cumulative_cf"],
-                "税効果": result["cumulative_tax_effect"],
-                "売却時手残り": result["sale_cash_after_tax"],
-                "ローン残債": result["loan_balance"],
-                "譲渡所得": result["capital_gain"],
-                "譲渡所得税": result["capital_gain_tax"],
-            }
-        )
+        records.append({
+            "保有年数": year,
+            "最終利益": result["final_profit"],
+            "運用中CF": result["cumulative_cf"],
+            "税効果": result["cumulative_tax_effect"],
+            "売却時手残り": result["sale_cash_after_tax"],
+            "ローン残債": result["loan_balance"],
+            "譲渡所得": result["capital_gain"],
+            "譲渡所得税": result["capital_gain_tax"],
+        })
     return pd.DataFrame(records)
 
 
-def main() -> None:
-    st.title("🏠 不動産投資・税金対策シミュレーター")
-    st.caption("空室率、固定資産税・都市計画税、管理委託料、原状回復・設備交換費、最適保有年数まで含めて概算します。単位は万円です。")
+def parse_pdf_properties(uploaded_file) -> pd.DataFrame:
+    if pdfplumber is None:
+        st.error("pdfplumber がインストールされていません。requirements.txtを再デプロイしてください。")
+        return pd.DataFrame()
 
+    rows = []
+    with pdfplumber.open(BytesIO(uploaded_file.getvalue())) as pdf:
+        for page_no, page in enumerate(pdf.pages, start=1):
+            text = page.extract_text() or ""
+            lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+            if not lines:
+                continue
+
+            first = lines[0]
+            m = re.match(r"(.+?)\s+([0-9,]+)$", first)
+            if not m:
+                continue
+            name = m.group(1).strip()
+            price = float(m.group(2).replace(",", ""))
+
+            yen_values = []
+            for mm in re.finditer(r"(?:￥|¥)?\s*([0-9]{1,3}(?:,[0-9]{3})+|[0-9]{4,})\s*円", text):
+                yen_values.append(int(mm.group(1).replace(",", "")))
+
+            annual_rent = None
+            monthly_rent = None
+            repair_monthly = None
+            management_monthly = None
+            if len(yen_values) >= 1:
+                annual_rent = yen_values[0] / 10000
+            if len(yen_values) >= 2:
+                monthly_rent = yen_values[1] / 10000
+            if len(yen_values) >= 4:
+                # RENOSY PDFでは、月額家賃の後に「修繕積立金」「建物管理費」の順で出るケースが多い
+                repair_monthly = yen_values[2] / 10000
+                management_monthly = yen_values[3] / 10000
+
+            status = ""
+            for key in ["賃貸中", "サブリース中", "空室"]:
+                if key in text:
+                    status = key
+                    break
+
+            gross_yield = annual_rent / price * 100 if annual_rent and price else None
+            rows.append({
+                "物件名": name,
+                "ページ": page_no,
+                "価格": price,
+                "月額家賃": monthly_rent,
+                "年間家賃": annual_rent,
+                "修繕積立金/月": repair_monthly,
+                "建物管理費/月": management_monthly,
+                "賃貸状態": status,
+                "表面利回り%": gross_yield,
+            })
+    return pd.DataFrame(rows)
+
+
+def build_inputs_from_row(row: pd.Series, defaults: dict) -> Inputs:
+    price = float(row["価格"])
+    rent_monthly = float(row["月額家賃"] or 0)
+    management_monthly = float(row["建物管理費/月"] or 0)
+    repair_monthly = float(row["修繕積立金/月"] or 0)
+    property_tax = estimate_property_city_tax(price, defaults["assessment_ratio"])
+    return Inputs(
+        purchase_price=price,
+        sale_price=price * defaults["sale_price_rate"] / 100,
+        rent_monthly=rent_monthly,
+        vacancy_rate=defaults["vacancy_rate"],
+        interest_rate=defaults["interest_rate"],
+        loan_years=defaults["loan_years"],
+        holding_years=defaults["holding_years"],
+        down_payment=price * defaults["down_payment_rate"] / 100,
+        purchase_cost_rate=defaults["purchase_cost_rate"],
+        sale_cost_rate=defaults["sale_cost_rate"],
+        management_monthly=management_monthly,
+        repair_monthly=repair_monthly,
+        property_city_tax_yearly=property_tax,
+        property_city_tax_mode="購入価格から概算",
+        assessment_ratio=defaults["assessment_ratio"],
+        management_outsource_rate=defaults["management_outsource_rate"],
+        restoration_equipment_yearly=defaults["restoration_equipment_yearly"],
+        building_ratio=defaults["building_ratio"],
+        useful_life_years=defaults["useful_life_years"],
+        income_tax_rate=defaults["income_tax_rate"],
+        capital_gain_tax_rate=defaults["capital_gain_tax_rate"],
+    )
+
+
+def format_df(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    for col in out.columns:
+        if col not in {"物件名", "賃貸状態", "年", "保有年数", "ページ"}:
+            out[col] = out[col].map(lambda x: "" if pd.isna(x) else f"{x:,.1f}")
+    return out
+
+
+def render_single_property_tab() -> None:
     with st.sidebar:
         st.header("① 物件・賃貸条件")
         purchase_price = st.number_input("購入価格", 500.0, 30000.0, 3000.0, 100.0)
@@ -210,20 +301,9 @@ def main() -> None:
         st.header("③ ランニングコスト")
         management_monthly = st.number_input("月額建物管理費", 0.0, 100.0, 1.0, 0.5)
         repair_monthly = st.number_input("月額修繕積立金", 0.0, 100.0, 1.0, 0.5)
-
-        property_city_tax_mode = st.radio(
-            "固定資産税・都市計画税",
-            ["購入価格から概算", "手入力"],
-            horizontal=True,
-        )
         assessment_ratio = st.number_input("評価額割合（概算用、購入価格に対する%）", 10.0, 100.0, 40.0, 5.0)
-        estimated_tax = estimate_property_city_tax(purchase_price, assessment_ratio)
-        if property_city_tax_mode == "購入価格から概算":
-            property_city_tax_yearly = estimated_tax
-            st.caption(f"概算値：{yen(property_city_tax_yearly)} / 年")
-        else:
-            property_city_tax_yearly = st.number_input("年間固定資産税・都市計画税", 0.0, 500.0, estimated_tax, 1.0)
-
+        property_city_tax_yearly = estimate_property_city_tax(purchase_price, assessment_ratio)
+        st.caption(f"固定資産税・都市計画税 概算：{yen(property_city_tax_yearly)} / 年")
         management_outsource_rate = st.number_input("管理委託料率（実効家賃に対する%）", 0.0, 20.0, 5.0, 0.5)
         restoration_equipment_yearly = st.number_input("年間 原状回復・設備交換費", 0.0, 500.0, 10.0, 1.0)
 
@@ -236,27 +316,10 @@ def main() -> None:
         capital_gain_tax_rate = st.number_input("譲渡所得税率（%）", 0.0, 60.0, 20.0, 1.0)
 
     inputs = Inputs(
-        purchase_price=purchase_price,
-        sale_price=sale_price,
-        rent_monthly=rent_monthly,
-        vacancy_rate=vacancy_rate,
-        interest_rate=interest_rate,
-        loan_years=int(loan_years),
-        holding_years=int(holding_years),
-        down_payment=down_payment,
-        purchase_cost_rate=purchase_cost_rate,
-        sale_cost_rate=sale_cost_rate,
-        management_monthly=management_monthly,
-        repair_monthly=repair_monthly,
-        property_city_tax_yearly=property_city_tax_yearly,
-        property_city_tax_mode=property_city_tax_mode,
-        assessment_ratio=assessment_ratio,
-        management_outsource_rate=management_outsource_rate,
-        restoration_equipment_yearly=restoration_equipment_yearly,
-        building_ratio=building_ratio,
-        useful_life_years=int(useful_life_years),
-        income_tax_rate=income_tax_rate,
-        capital_gain_tax_rate=capital_gain_tax_rate,
+        purchase_price, sale_price, rent_monthly, vacancy_rate, interest_rate, int(loan_years), int(holding_years),
+        down_payment, purchase_cost_rate, sale_cost_rate, management_monthly, repair_monthly,
+        property_city_tax_yearly, "購入価格から概算", assessment_ratio, management_outsource_rate,
+        restoration_equipment_yearly, building_ratio, int(useful_life_years), income_tax_rate, capital_gain_tax_rate,
     )
     r = simulate(inputs)
 
@@ -270,90 +333,9 @@ def main() -> None:
     cols[5].metric("初期持ち出し", yen(r["initial_cash_out"]))
 
     st.info("最終利益 ＝ 運用中CF ＋ 運用中の税効果 ＋ 売却時手残り − 初期持ち出し")
-
-    st.subheader("計算内訳")
-    c1, c2, c3, c4 = st.columns(4)
-    with c1:
-        st.markdown("#### ① 家賃・空室")
-        st.write(f"満室想定年間家賃 = {yen(inputs.rent_monthly * 12)}")
-        st.write(f"空室率 = {inputs.vacancy_rate:.1f}%")
-        st.write(f"年間空室損失 = {yen(inputs.rent_monthly * 12 * inputs.vacancy_rate / 100)}")
-        st.write(f"実効年間家賃 = {yen(inputs.rent_monthly * 12 * (1 - inputs.vacancy_rate / 100))}")
-    with c2:
-        st.markdown("#### ② ランニングコスト")
-        st.write(f"固定資産税・都市計画税 = {yen(inputs.property_city_tax_yearly)} / 年")
-        st.write(f"管理委託料率 = {inputs.management_outsource_rate:.1f}%")
-        st.write(f"管理委託料累計 = {yen(r['total_outsource_fee'])}")
-        st.write(f"原状回復・設備交換費 = {yen(inputs.restoration_equipment_yearly)} / 年")
-    with c3:
-        st.markdown("#### ③ ローン・減価償却")
-        st.write(f"借入額 = {yen(r['loan_amount'])}")
-        st.write(f"毎月返済 = {r['monthly_payment']:,.2f} 万円")
-        st.write(f"保有期間終了時の残債 = {yen(r['loan_balance'])}")
-        st.write(f"減価償却累計 = {yen(r['cumulative_depreciation'])}")
-    with c4:
-        st.markdown("#### ④ 譲渡所得")
-        st.write(f"建物簿価 = {yen(r['building_book_value'])}")
-        st.write(f"取得費 = 土地簿価 + 建物簿価 = {yen(r['acquisition_cost'])}")
-        st.write(f"譲渡所得 = {yen(r['capital_gain'])}")
-        st.write(f"譲渡所得税 = {yen(r['capital_gain_tax'])}")
-
-    st.subheader("固定資産税・都市計画税の概算ロジック")
-    st.code(
-        f"""
-固定資産税・都市計画税（概算）
-= 購入価格 × 評価額割合 × 税率
-= 購入価格 × 評価額割合 × (固定資産税1.4% + 都市計画税0.3%)
-= {inputs.purchase_price:.0f} × {inputs.assessment_ratio:.1f}% × 1.7%
-= {estimate_property_city_tax(inputs.purchase_price, inputs.assessment_ratio):.1f} 万円 / 年
-
-※評価額割合は概算用です。実額は納税通知書、重要事項説明書、固定資産評価証明書などで確認してください。
-※住宅用地特例、新築軽減、自治体差、土地・建物の評価差は簡略化しています。
-""",
-        language="text",
-    )
-
-    st.subheader("全体数式")
-    st.code(
-        f"""
-実効家賃収入
-= 満室想定家賃 × (1 - 空室率)
-= {inputs.rent_monthly * 12:.0f} × (1 - {inputs.vacancy_rate:.1f}%)
-= {inputs.rent_monthly * 12 * (1 - inputs.vacancy_rate / 100):.0f} 万円 / 年
-
-管理委託料
-= 実効家賃収入 × 管理委託料率
-
-最終利益
-= 運用中CF + 運用中の税効果 + 売却時手残り - 初期持ち出し
-= {r['cumulative_cf']:.0f} + {r['cumulative_tax_effect']:.0f} + {r['sale_cash_after_tax']:.0f} - {r['initial_cash_out']:.0f}
-= {r['final_profit']:.0f} 万円
-
-譲渡所得
-= 売却価格 - 取得費 - 売却費用
-= 売却価格 - (土地簿価 + 建物簿価) - 売却費用
-= {inputs.sale_price:.0f} - ({r['land_price']:.0f} + {r['building_book_value']:.0f}) - {r['sale_cost']:.0f}
-= {r['capital_gain']:.0f} 万円
-
-建物簿価
-= 建物価格 - 減価償却累計
-= {r['building_price']:.0f} - {r['cumulative_depreciation']:.0f}
-= {r['building_book_value']:.0f} 万円
-""",
-        language="text",
-    )
-
     st.subheader("年次キャッシュフロー")
-    df = r["rows"].copy()
-    display_df = df.copy()
-    for col in display_df.columns:
-        if col != "年":
-            display_df[col] = display_df[col].map(lambda x: f"{x:,.1f}")
-    st.dataframe(display_df, use_container_width=True, hide_index=True)
-
-    st.subheader("グラフ")
-    chart_df = df.set_index("年")[["実効家賃収入", "空室損失", "税前CF", "税後CF", "ローン残債"]]
-    st.line_chart(chart_df)
+    st.dataframe(format_df(r["rows"]), use_container_width=True, hide_index=True)
+    st.line_chart(r["rows"].set_index("年")[["実効家賃収入", "税前CF", "税後CF", "ローン残債"]])
 
     st.subheader("最適保有年数分析")
     analysis_df = analyze_holding_years(inputs, int(max_analysis_years))
@@ -362,16 +344,92 @@ def main() -> None:
     b1.metric("最終利益が最大の保有年数", f"{int(best_row['保有年数'])} 年")
     b2.metric("最大最終利益", yen(best_row["最終利益"]))
     b3.metric("その時の売却時手残り", yen(best_row["売却時手残り"]))
-
-    st.caption("この分析は、売却価格・家賃・空室率・費用率が毎年変わらない前提で、保有年数だけを1年ずつ変えて再計算します。")
     st.line_chart(analysis_df.set_index("保有年数")[["最終利益", "運用中CF", "売却時手残り", "ローン残債"]])
 
-    display_analysis_df = analysis_df.copy()
-    for col in display_analysis_df.columns:
-        if col != "保有年数":
-            display_analysis_df[col] = display_analysis_df[col].map(lambda x: f"{x:,.1f}")
-    st.dataframe(display_analysis_df, use_container_width=True, hide_index=True)
 
+def render_pdf_compare_tab() -> None:
+    st.subheader("PDF自動読み取り・複数物件比較")
+    st.caption("文字データを含むPDFに対応します。画像スキャンPDFは未対応です。")
+
+    uploaded = st.file_uploader("物件PDFをアップロード", type=["pdf"])
+    with st.expander("共通前提", expanded=True):
+        c1, c2, c3, c4 = st.columns(4)
+        defaults = {
+            "vacancy_rate": c1.number_input("空室率%", 0.0, 30.0, 10.0, 0.5, key="cmp_vacancy"),
+            "interest_rate": c1.number_input("金利%", 0.0, 10.0, 2.0, 0.1, key="cmp_rate"),
+            "loan_years": int(c1.number_input("ローン年数", 1, 50, 35, 1, key="cmp_loan_years")),
+            "holding_years": int(c2.number_input("保有年数", 1, 50, 5, 1, key="cmp_holding_years")),
+            "sale_price_rate": c2.number_input("売却価格 / 購入価格%", 50.0, 150.0, 100.0, 1.0, key="cmp_sale_rate"),
+            "down_payment_rate": c2.number_input("頭金率%", 0.0, 100.0, 0.0, 5.0, key="cmp_down_rate"),
+            "purchase_cost_rate": c3.number_input("購入諸費用率%", 0.0, 20.0, 7.0, 0.5, key="cmp_purchase_cost"),
+            "sale_cost_rate": c3.number_input("売却諸費用率%", 0.0, 20.0, 4.0, 0.5, key="cmp_sale_cost"),
+            "assessment_ratio": c3.number_input("評価額割合%", 10.0, 100.0, 40.0, 5.0, key="cmp_assess"),
+            "management_outsource_rate": c4.number_input("管理委託料率%", 0.0, 20.0, 5.0, 0.5, key="cmp_outsource"),
+            "restoration_equipment_yearly": c4.number_input("原状回復・設備交換費/年", 0.0, 500.0, 10.0, 1.0, key="cmp_repair_cost"),
+            "building_ratio": c4.number_input("建物割合%", 0.0, 100.0, 80.0, 5.0, key="cmp_building"),
+            "useful_life_years": 47,
+            "income_tax_rate": 20.0,
+            "capital_gain_tax_rate": 20.0,
+        }
+
+    if uploaded is None:
+        st.info("PDFをアップロードすると、自動抽出結果とランキングを表示します。")
+        return
+
+    extracted = parse_pdf_properties(uploaded)
+    if extracted.empty:
+        st.warning("物件情報を抽出できませんでした。PDFが画像のみの場合は未対応です。")
+        return
+
+    st.markdown("#### 抽出結果")
+    edited = st.data_editor(extracted, use_container_width=True, hide_index=True, num_rows="dynamic")
+
+    results = []
+    detail_results = {}
+    for _, row in edited.dropna(subset=["価格", "月額家賃"]).iterrows():
+        inputs = build_inputs_from_row(row, defaults)
+        result = simulate(inputs)
+        detail_results[row["物件名"]] = result
+        results.append({
+            "物件名": row["物件名"],
+            "価格": inputs.purchase_price,
+            "月額家賃": inputs.rent_monthly,
+            "表面利回り%": row.get("表面利回り%"),
+            "最終利益": result["final_profit"],
+            "運用中CF": result["cumulative_cf"],
+            "税効果": result["cumulative_tax_effect"],
+            "売却時手残り": result["sale_cash_after_tax"],
+            "空室損失累計": result["total_vacancy_loss"],
+            "ローン残債": result["loan_balance"],
+            "賃貸状態": row.get("賃貸状態", ""),
+        })
+
+    result_df = pd.DataFrame(results).sort_values("最終利益", ascending=False)
+    st.markdown("#### 比較ランキング")
+    st.dataframe(format_df(result_df), use_container_width=True, hide_index=True)
+    st.bar_chart(result_df.set_index("物件名")[["最終利益", "運用中CF", "売却時手残り"]])
+
+    selected = st.selectbox("詳細を見る物件", result_df["物件名"].tolist())
+    if selected:
+        st.markdown(f"#### {selected} の年次CF")
+        st.dataframe(format_df(detail_results[selected]["rows"]), use_container_width=True, hide_index=True)
+
+    st.download_button(
+        "比較結果CSVをダウンロード",
+        result_df.to_csv(index=False).encode("utf-8-sig"),
+        file_name="real_estate_comparison.csv",
+        mime="text/csv",
+    )
+
+
+def main() -> None:
+    st.title("🏠 不動産投資・税金対策シミュレーター")
+    st.caption("単独物件分析と、PDF自動読み取りによる複数物件比較に対応しています。")
+    tab_single, tab_pdf = st.tabs(["単独物件分析", "PDF複数物件比較"])
+    with tab_single:
+        render_single_property_tab()
+    with tab_pdf:
+        render_pdf_compare_tab()
     st.caption("注意：本アプリは概算シミュレーションです。実際の税務判断は税理士等に確認してください。")
 
 
