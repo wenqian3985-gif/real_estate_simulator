@@ -14,9 +14,12 @@ except ImportError:  # pragma: no cover
     pdfplumber = None
 
 try:
-    from openai import OpenAI
+    from google import genai
+    from google.genai import types
 except ImportError:  # pragma: no cover
-    OpenAI = None
+    genai = None
+    types = None
+
 
 st.set_page_config(page_title="不動産投資シミュレーター", page_icon="🏠", layout="wide")
 
@@ -242,12 +245,12 @@ def _as_float(value) -> float | None:
 
 
 def parse_pdf_properties_ai(uploaded_file) -> pd.DataFrame:
-    if OpenAI is None:
-        st.error("openai パッケージがありません。requirements.txt反映後に再デプロイしてください。")
+    if genai is None or types is None:
+        st.error("google-genai パッケージがありません。requirements.txt反映後に再デプロイしてください。")
         return pd.DataFrame()
-    api_key = st.secrets.get("OPENAI_API_KEY", None)
+    api_key = st.secrets.get("GEMINI_API_KEY", None)
     if not api_key:
-        st.error("Streamlit Secrets に OPENAI_API_KEY が見つかりません。")
+        st.error("Streamlit Secrets に GEMINI_API_KEY が見つかりません。")
         return pd.DataFrame()
 
     text = extract_pdf_text(uploaded_file)
@@ -255,15 +258,17 @@ def parse_pdf_properties_ai(uploaded_file) -> pd.DataFrame:
         st.warning("PDFからテキストを抽出できませんでした。画像スキャンPDFの場合、次の版で画像OCR対応が必要です。")
         return pd.DataFrame()
 
-    model = st.secrets.get("OPENAI_MODEL", "gpt-4o-mini")
-    client = OpenAI(api_key=api_key)
+    model = st.secrets.get("GEMINI_MODEL", "gemini-1.5-flash")
+    client = genai.Client(api_key=api_key)
     prompt = f"""
 あなたは日本の不動産投資資料を読み取る専門アシスタントです。
 以下のPDF抽出テキストから、物件ごとに必要項目を抽出してください。
 単位は必ず「万円」に統一してください。円表記は10000で割って万円にしてください。
+価格が「6,270」のように表示されている場合は「6,270万円」として扱ってください。
 管理費と修繕積立金は取り違えないでください。不明な場合は null にしてください。
+返答はJSONのみで、余計な文章やMarkdownは不要です。
 
-返答はJSONのみ。形式：
+形式：
 {{
   "properties": [
     {{
@@ -288,19 +293,18 @@ PDF抽出テキスト：
 {text[:50000]}
 """
     try:
-        resp = client.chat.completions.create(
+        resp = client.models.generate_content(
             model=model,
-            messages=[
-                {"role": "system", "content": "Return only valid JSON. No markdown."},
-                {"role": "user", "content": prompt},
-            ],
-            response_format={"type": "json_object"},
-            temperature=0,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                temperature=0,
+            ),
         )
-        content = resp.choices[0].message.content or "{}"
+        content = resp.text or "{}"
         data = json.loads(content)
     except Exception as exc:
-        st.error("AI抽出でエラーが発生しました。")
+        st.error("Gemini AI抽出でエラーが発生しました。")
         st.exception(exc)
         return pd.DataFrame()
 
@@ -325,7 +329,7 @@ PDF抽出テキスト：
             "専有面積㎡": _as_float(p.get("専有面積㎡")),
             "駅徒歩": p.get("駅徒歩"),
             "表面利回り%": annual_rent / price * 100 if annual_rent and price else None,
-            "抽出方法": "AI",
+            "抽出方法": "Gemini AI",
             "抽出メモ": p.get("抽出メモ", "OK"),
         })
     return pd.DataFrame(rows)
@@ -416,7 +420,7 @@ def render_single_property_tab() -> None:
 
 def render_pdf_compare_tab() -> None:
     st.subheader("PDF自動読み取り・複数物件比較")
-    extraction_mode = st.radio("抽出方式", ["AI抽出", "ルール抽出"], horizontal=True)
+    extraction_mode = st.radio("抽出方式", ["Gemini AI抽出", "ルール抽出"], horizontal=True)
     uploaded = st.file_uploader("物件PDFをアップロード", type=["pdf"])
     with st.expander("共通前提", expanded=True):
         c1, c2, c3, c4 = st.columns(4)
@@ -442,7 +446,7 @@ def render_pdf_compare_tab() -> None:
         return
 
     with st.spinner("PDFを読み取り中..."):
-        extracted = parse_pdf_properties_ai(uploaded) if extraction_mode == "AI抽出" else parse_pdf_properties_rule(uploaded)
+        extracted = parse_pdf_properties_ai(uploaded) if extraction_mode == "Gemini AI抽出" else parse_pdf_properties_rule(uploaded)
     if extracted.empty:
         st.warning("物件情報を抽出できませんでした。")
         return
@@ -484,7 +488,7 @@ def render_pdf_compare_tab() -> None:
 
 def main() -> None:
     st.title("🏠 不動産投資・税金対策シミュレーター")
-    st.caption("単独物件分析と、AIによるPDF複数物件比較に対応しています。")
+    st.caption("単独物件分析と、Gemini AIによるPDF複数物件比較に対応しています。")
     tab_single, tab_pdf = st.tabs(["単独物件分析", "PDF複数物件比較"])
     with tab_single:
         render_single_property_tab()
