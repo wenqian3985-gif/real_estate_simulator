@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import pandas as pd
 import streamlit as st
@@ -170,9 +170,28 @@ def simulate(i: Inputs) -> dict:
     }
 
 
+def analyze_holding_years(inputs: Inputs, max_years: int) -> pd.DataFrame:
+    records = []
+    for year in range(1, max_years + 1):
+        result = simulate(replace(inputs, holding_years=year))
+        records.append(
+            {
+                "保有年数": year,
+                "最終利益": result["final_profit"],
+                "運用中CF": result["cumulative_cf"],
+                "税効果": result["cumulative_tax_effect"],
+                "売却時手残り": result["sale_cash_after_tax"],
+                "ローン残債": result["loan_balance"],
+                "譲渡所得": result["capital_gain"],
+                "譲渡所得税": result["capital_gain_tax"],
+            }
+        )
+    return pd.DataFrame(records)
+
+
 def main() -> None:
     st.title("🏠 不動産投資・税金対策シミュレーター")
-    st.caption("空室率、固定資産税・都市計画税、管理委託料、原状回復・設備交換費まで含めて概算します。単位は万円です。")
+    st.caption("空室率、固定資産税・都市計画税、管理委託料、原状回復・設備交換費、最適保有年数まで含めて概算します。単位は万円です。")
 
     with st.sidebar:
         st.header("① 物件・賃貸条件")
@@ -186,6 +205,7 @@ def main() -> None:
         interest_rate = st.number_input("ローン金利（%）", 0.0, 10.0, 2.0, 0.1)
         loan_years = st.number_input("ローン年数", 1, 50, 35, 1)
         holding_years = st.number_input("保有年数", 1, 50, 5, 1)
+        max_analysis_years = st.number_input("最適保有年数分析の上限年数", 1, 50, min(35, int(loan_years)), 1)
 
         st.header("③ ランニングコスト")
         management_monthly = st.number_input("月額建物管理費", 0.0, 100.0, 1.0, 0.5)
@@ -334,6 +354,23 @@ def main() -> None:
     st.subheader("グラフ")
     chart_df = df.set_index("年")[["実効家賃収入", "空室損失", "税前CF", "税後CF", "ローン残債"]]
     st.line_chart(chart_df)
+
+    st.subheader("最適保有年数分析")
+    analysis_df = analyze_holding_years(inputs, int(max_analysis_years))
+    best_row = analysis_df.loc[analysis_df["最終利益"].idxmax()]
+    b1, b2, b3 = st.columns(3)
+    b1.metric("最終利益が最大の保有年数", f"{int(best_row['保有年数'])} 年")
+    b2.metric("最大最終利益", yen(best_row["最終利益"]))
+    b3.metric("その時の売却時手残り", yen(best_row["売却時手残り"]))
+
+    st.caption("この分析は、売却価格・家賃・空室率・費用率が毎年変わらない前提で、保有年数だけを1年ずつ変えて再計算します。")
+    st.line_chart(analysis_df.set_index("保有年数")[["最終利益", "運用中CF", "売却時手残り", "ローン残債"]])
+
+    display_analysis_df = analysis_df.copy()
+    for col in display_analysis_df.columns:
+        if col != "保有年数":
+            display_analysis_df[col] = display_analysis_df[col].map(lambda x: f"{x:,.1f}")
+    st.dataframe(display_analysis_df, use_container_width=True, hide_index=True)
 
     st.caption("注意：本アプリは概算シミュレーションです。実際の税務判断は税理士等に確認してください。")
 
