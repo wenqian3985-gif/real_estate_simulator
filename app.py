@@ -18,6 +18,7 @@ class Inputs:
     purchase_price: float
     sale_price: float
     rent_monthly: float
+    vacancy_rate: float
     interest_rate: float
     loan_years: int
     holding_years: int
@@ -61,6 +62,7 @@ def simulate(i: Inputs) -> dict:
     cumulative_depreciation = 0.0
     total_interest = 0.0
     total_principal = 0.0
+    total_vacancy_loss = 0.0
 
     for year in range(1, i.holding_years + 1):
         interest_paid = 0.0
@@ -74,14 +76,16 @@ def simulate(i: Inputs) -> dict:
             interest_paid += interest
             principal_paid += principal
 
-        rent = i.rent_monthly * 12
+        gross_rent = i.rent_monthly * 12
+        vacancy_loss = gross_rent * i.vacancy_rate / 100
+        effective_rent = gross_rent - vacancy_loss
         management = i.management_monthly * 12
         repair = i.repair_monthly * 12
         operating_expenses = management + repair + i.property_tax_yearly
         loan_payment = interest_paid + principal_paid
-        cf_before_tax = rent - operating_expenses - loan_payment
+        cf_before_tax = effective_rent - operating_expenses - loan_payment
 
-        tax_income = rent - operating_expenses - interest_paid - yearly_depreciation
+        tax_income = effective_rent - operating_expenses - interest_paid - yearly_depreciation
         tax_effect = -tax_income * i.income_tax_rate / 100
         # 税務上赤字なら節税プラス、黒字なら納税マイナス
         cf_after_tax = cf_before_tax + tax_effect
@@ -91,11 +95,14 @@ def simulate(i: Inputs) -> dict:
         cumulative_depreciation += yearly_depreciation
         total_interest += interest_paid
         total_principal += principal_paid
+        total_vacancy_loss += vacancy_loss
 
         rows.append(
             {
                 "年": year,
-                "家賃収入": rent,
+                "満室想定家賃": gross_rent,
+                "空室損失": vacancy_loss,
+                "実効家賃収入": effective_rent,
                 "管理費・修繕積立金": management + repair,
                 "固定資産税等": i.property_tax_yearly,
                 "ローン返済": loan_payment,
@@ -142,18 +149,20 @@ def simulate(i: Inputs) -> dict:
         "final_profit": final_profit,
         "total_interest": total_interest,
         "total_principal": total_principal,
+        "total_vacancy_loss": total_vacancy_loss,
     }
 
 
 def main() -> None:
     st.title("🏠 不動産投資・税金対策シミュレーター")
-    st.caption("減価償却、運用中CF、譲渡所得、売却時手残り、最終利益を一画面で確認します。単位は万円です。")
+    st.caption("減価償却、空室率、運用中CF、譲渡所得、売却時手残り、最終利益を一画面で確認します。単位は万円です。")
 
     with st.sidebar:
         st.header("入力条件")
         purchase_price = st.number_input("購入価格", 500.0, 20000.0, 3000.0, 100.0)
         sale_price = st.number_input("売却価格", 500.0, 20000.0, 3000.0, 100.0)
-        rent_monthly = st.number_input("月額家賃", 1.0, 200.0, 10.0, 1.0)
+        rent_monthly = st.number_input("月額家賃（満室想定）", 1.0, 200.0, 10.0, 1.0)
+        vacancy_rate = st.slider("空室率（%）", 0.0, 30.0, 5.0, 0.5)
         down_payment = st.number_input("頭金", 0.0, 20000.0, 0.0, 100.0)
         interest_rate = st.number_input("ローン金利（%）", 0.0, 10.0, 2.2, 0.1)
         loan_years = st.number_input("ローン年数", 1, 50, 35, 1)
@@ -176,6 +185,7 @@ def main() -> None:
         purchase_price=purchase_price,
         sale_price=sale_price,
         rent_monthly=rent_monthly,
+        vacancy_rate=vacancy_rate,
         interest_rate=interest_rate,
         loan_years=int(loan_years),
         holding_years=int(holding_years),
@@ -193,32 +203,40 @@ def main() -> None:
     r = simulate(inputs)
 
     st.subheader("結論")
-    cols = st.columns(5)
+    cols = st.columns(6)
     cols[0].metric("最終利益", yen(r["final_profit"]))
     cols[1].metric("運用中CF", yen(r["cumulative_cf"]))
-    cols[2].metric("運用中の税効果", yen(r["cumulative_tax_saving"]))
-    cols[3].metric("売却時手残り", yen(r["sale_cash_after_tax"]))
-    cols[4].metric("初期持ち出し", yen(r["initial_cash_out"]))
+    cols[2].metric("空室損失累計", yen(r["total_vacancy_loss"]))
+    cols[3].metric("運用中の税効果", yen(r["cumulative_tax_saving"]))
+    cols[4].metric("売却時手残り", yen(r["sale_cash_after_tax"]))
+    cols[5].metric("初期持ち出し", yen(r["initial_cash_out"]))
 
     st.info(
-        "最終利益 ＝ 運用中CF ＋ 運用中の税効果 ＋ 売却時手残り − 初期持ち出し"
+        "最終利益 ＝ 運用中CF ＋ 運用中の税効果 ＋ 売却時手残り − 初期持ち出し。"
+        "空室率は満室想定家賃から差し引き、実効家賃収入としてCFと税務上所得に反映しています。"
     )
 
     st.subheader("計算内訳")
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
     with c1:
-        st.markdown("#### ① ローン")
+        st.markdown("#### ① 家賃・空室")
+        st.write(f"満室想定年間家賃 = {yen(inputs.rent_monthly * 12)}")
+        st.write(f"空室率 = {inputs.vacancy_rate:.1f}%")
+        st.write(f"年間空室損失 = {yen(inputs.rent_monthly * 12 * inputs.vacancy_rate / 100)}")
+        st.write(f"空室損失累計 = {yen(r['total_vacancy_loss'])}")
+    with c2:
+        st.markdown("#### ② ローン")
         st.write(f"借入額 = {yen(r['loan_amount'])}")
         st.write(f"毎月返済 = {r['monthly_payment']:,.2f} 万円")
-        st.write(f"5年後等の残債 = {yen(r['loan_balance'])}")
-    with c2:
-        st.markdown("#### ② 減価償却")
+        st.write(f"保有期間終了時の残債 = {yen(r['loan_balance'])}")
+    with c3:
+        st.markdown("#### ③ 減価償却")
         st.write(f"建物価格 = {yen(r['building_price'])}")
         st.write(f"土地価格 = {yen(r['land_price'])}")
         st.write(f"年間減価償却 = {yen(r['yearly_depreciation'])}")
         st.write(f"減価償却累計 = {yen(r['cumulative_depreciation'])}")
-    with c3:
-        st.markdown("#### ③ 譲渡所得")
+    with c4:
+        st.markdown("#### ④ 譲渡所得")
         st.write(f"建物簿価 = {yen(r['building_book_value'])}")
         st.write(f"取得費 = 土地簿価 + 建物簿価 = {yen(r['acquisition_cost'])}")
         st.write(f"譲渡所得 = 売却価格 − 取得費 − 売却費用 = {yen(r['capital_gain'])}")
@@ -227,6 +245,11 @@ def main() -> None:
     st.subheader("数式")
     st.code(
         f"""
+実効家賃収入
+= 満室想定家賃 × (1 - 空室率)
+= {inputs.rent_monthly * 12:.0f} × (1 - {inputs.vacancy_rate:.1f}%)
+= {inputs.rent_monthly * 12 * (1 - inputs.vacancy_rate / 100):.0f} 万円 / 年
+
 最終利益
 = 運用中CF + 運用中の税効果 + 売却時手残り - 初期持ち出し
 = {r['cumulative_cf']:.0f} + {r['cumulative_tax_saving']:.0f} + {r['sale_cash_after_tax']:.0f} - {r['initial_cash_out']:.0f}
@@ -255,7 +278,7 @@ def main() -> None:
     st.dataframe(display_df, use_container_width=True, hide_index=True)
 
     st.subheader("グラフ")
-    chart_df = df.set_index("年")[["税前CF", "税後CF", "ローン残債"]]
+    chart_df = df.set_index("年")[["実効家賃収入", "空室損失", "税前CF", "税後CF", "ローン残債"]]
     st.line_chart(chart_df)
 
     st.caption("注意：本アプリは概算シミュレーションです。実際の税務判断は税理士等に確認してください。")
