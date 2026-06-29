@@ -161,29 +161,40 @@ def analyze_years(i: Inputs, max_years: int) -> pd.DataFrame:
     rows = []
     for y in range(1, max_years + 1):
         r = simulate(replace(i, holding_years=y))
-        rows.append({"保有年数": y, "最終利益": r["final_profit"], "運用中CF": r["cumulative_cf"], "税効果": r["cumulative_tax_effect"], "売却時手残り": r["sale_cash_after_tax"], "ローン残債": r["loan_balance"]})
+        rows.append({
+            "保有年数": y,
+            "最終利益": r["final_profit"],
+            "運用中CF": r["cumulative_cf"],
+            "税効果": r["cumulative_tax_effect"],
+            "売却時手残り": r["sale_cash_after_tax"],
+            "ローン残債": r["loan_balance"],
+        })
     return pd.DataFrame(rows)
 
 
-def formula_line(label: str, value: float, formula: str, help_text: str | None = None) -> None:
-    c1, c2, c3 = st.columns([2.0, 1.2, 5.2])
+def formula_line(label: str, value: float, formula: str) -> None:
+    c1, c2, c3 = st.columns([2.0, 1.3, 5.8])
     c1.markdown(f"**{label}**")
     c2.markdown(f"**{yen(value)}**")
     c3.code(formula, language="text")
-    if help_text:
-        st.caption(help_text)
 
 
 def render_formula_logic(i: Inputs, r: dict) -> None:
+    df = r["rows"]
+    years = i.holding_years
     yearly_gross = i.rent_monthly * 12
     yearly_vacancy = yearly_gross * i.vacancy_rate / 100
     yearly_effective = yearly_gross - yearly_vacancy
     yearly_management = i.management_monthly * 12
     yearly_repair = i.repair_monthly * 12
     yearly_outsource = yearly_effective * i.management_outsource_rate / 100
-    avg_loan_payment = r["rows"]["ローン返済"].mean() if not r["rows"].empty else 0
-    avg_interest = r["rows"]["うち利息"].mean() if not r["rows"].empty else 0
-    first_year_cf = r["rows"].iloc[0]["税前CF"] if not r["rows"].empty else 0
+    yearly_cash_expenses = yearly_management + yearly_repair + i.property_city_tax_yearly + yearly_outsource + i.restoration_equipment_yearly
+    avg_loan_payment = df["ローン返済"].mean() if not df.empty else 0
+    avg_interest = df["うち利息"].mean() if not df.empty else 0
+    avg_cf = r["cumulative_cf"] / years if years else 0
+    taxable_sum = df["税務上所得"].sum() if not df.empty else 0
+    taxable_avg = taxable_sum / years if years else 0
+    avg_tax_effect = r["cumulative_tax_effect"] / years if years else 0
 
     st.subheader("計算ロジック")
     formula_line(
@@ -194,27 +205,88 @@ def render_formula_logic(i: Inputs, r: dict) -> None:
     formula_line(
         "運用中CF",
         r["cumulative_cf"],
-        "= Σ[実効家賃収入 - 建物管理費 - 修繕積立金 - 固定資産税・都市計画税 - 管理委託料 - 原状回復・設備交換費 - ローン返済]",
+        f"= 平均年間CF {yen(avg_cf)} × 保有年数 {years}年",
     )
     formula_line(
-        "1年目 運用中CF",
-        first_year_cf,
-        f"= 実効家賃 {yen(yearly_effective)} - 建物管理費 {yen(yearly_management)} - 修繕積立金 {yen(yearly_repair)} - 固定資産税・都市計画税 {yen(i.property_city_tax_yearly)} - 管理委託料 {yen(yearly_outsource)} - 原状回復・設備交換費 {yen(i.restoration_equipment_yearly)} - ローン返済 {yen(r['rows'].iloc[0]['ローン返済'] if not r['rows'].empty else 0)}",
+        "平均年間CF",
+        avg_cf,
+        f"= 実効家賃 {yen(yearly_effective)} - 年間経費 {yen(yearly_cash_expenses)} - 平均ローン返済 {yen(avg_loan_payment)}",
     )
-    formula_line("実効家賃収入/年", yearly_effective, f"= 月額家賃 {yen(i.rent_monthly)} × 12か月 - 空室損失 {yen(yearly_vacancy)}")
-    formula_line("空室損失/年", yearly_vacancy, f"= 月額家賃 {yen(i.rent_monthly)} × 12か月 × 空室率 {i.vacancy_rate:.1f}%")
-    formula_line("管理委託料/年", yearly_outsource, f"= 実効家賃収入 {yen(yearly_effective)} × 管理委託料率 {i.management_outsource_rate:.1f}%")
-    formula_line("ローン返済/月", r["monthly_payment"], f"= 借入金 {yen(r['loan_amount'])}、金利 {i.interest_rate:.2f}%、期間 {i.loan_years}年の元利均等返済")
-    formula_line("平均ローン返済/年", avg_loan_payment, f"= 月額返済 {yen(r['monthly_payment'])} × 12か月（概算。最終年は残債により変動）")
-    formula_line("税効果", r["cumulative_tax_effect"], f"= - Σ[税務上所得 × 運用中税率 {i.income_tax_rate:.1f}%]。税務上赤字ならプラス、黒字ならマイナス")
-    formula_line("税務上所得/年 概算", yearly_effective - yearly_management - yearly_repair - i.property_city_tax_yearly - yearly_outsource - i.restoration_equipment_yearly - avg_interest - r["yearly_depreciation"], "= 実効家賃 - 経費 - 支払利息 - 減価償却")
-    formula_line("減価償却/年", r["yearly_depreciation"], f"= 建物価格 {yen(r['building_price'])} ÷ 償却年数 {i.useful_life_years}年")
-    formula_line("売却時手残り", r["sale_cash_after_tax"], f"= 売却価格 {yen(i.sale_price)} - 売却費用 {yen(r['sale_cost'])} - ローン残債 {yen(r['loan_balance'])} - 譲渡所得税 {yen(r['capital_gain_tax'])}")
-    formula_line("譲渡所得", r["capital_gain"], f"= 売却価格 {yen(i.sale_price)} - 取得費 {yen(r['acquisition_cost'])} - 売却費用 {yen(r['sale_cost'])}")
-    formula_line("取得費", r["acquisition_cost"], f"= 土地簿価 {yen(r['land_price'])} + 建物簿価 {yen(r['building_book_value'])}")
-    formula_line("建物簿価", r["building_book_value"], f"= 建物価格 {yen(r['building_price'])} - 累計減価償却 {yen(r['cumulative_depreciation'])}")
-    formula_line("固定資産税・都市計画税/年", i.property_city_tax_yearly, f"= 購入価格 {yen(i.purchase_price)} × 評価額割合 {i.assessment_ratio:.1f}% × 1.7%")
-    formula_line("初期持ち出し", r["initial_cash_out"], f"= 頭金 {yen(i.down_payment)} + 購入諸費用 {yen(r['purchase_cost'])}")
+    formula_line(
+        "実効家賃収入/年",
+        yearly_effective,
+        f"= 月額家賃 {yen(i.rent_monthly)} × 12か月 - 空室損失 {yen(yearly_vacancy)}",
+    )
+    formula_line(
+        "空室損失/年",
+        yearly_vacancy,
+        f"= 月額家賃 {yen(i.rent_monthly)} × 12か月 × 空室率 {i.vacancy_rate:.1f}%",
+    )
+    formula_line(
+        "年間経費",
+        yearly_cash_expenses,
+        f"= 建物管理費 {yen(yearly_management)} + 修繕積立金 {yen(yearly_repair)} + 固定資産税・都市計画税 {yen(i.property_city_tax_yearly)} + 管理委託料 {yen(yearly_outsource)} + 原状回復・設備交換費 {yen(i.restoration_equipment_yearly)}",
+    )
+    formula_line(
+        "管理委託料/年",
+        yearly_outsource,
+        f"= 実効家賃収入 {yen(yearly_effective)} × 管理委託料率 {i.management_outsource_rate:.1f}%",
+    )
+    formula_line(
+        "平均ローン返済/年",
+        avg_loan_payment,
+        f"= 月額ローン返済 {yen(r['monthly_payment'])} × 12か月（保有期間中の平均。端数年・完済時は残債で調整）",
+    )
+    formula_line(
+        "月額ローン返済",
+        r["monthly_payment"],
+        f"= 借入金 {yen(r['loan_amount'])}、金利 {i.interest_rate:.2f}%、ローン年数 {i.loan_years}年の元利均等返済",
+    )
+    formula_line(
+        "税効果",
+        r["cumulative_tax_effect"],
+        f"= - 平均税務上所得 {yen(taxable_avg)} × 運用中税率 {i.income_tax_rate:.1f}% × 保有年数 {years}年 = 平均年税効果 {yen(avg_tax_effect)} × {years}年",
+    )
+    formula_line(
+        "平均税務上所得/年",
+        taxable_avg,
+        f"= 実効家賃 {yen(yearly_effective)} - 年間経費 {yen(yearly_cash_expenses)} - 平均支払利息 {yen(avg_interest)} - 減価償却 {yen(r['yearly_depreciation'])}",
+    )
+    formula_line(
+        "減価償却/年",
+        r["yearly_depreciation"],
+        f"= 建物価格 {yen(r['building_price'])} ÷ 償却年数 {i.useful_life_years}年",
+    )
+    formula_line(
+        "売却時手残り",
+        r["sale_cash_after_tax"],
+        f"= 売却価格 {yen(i.sale_price)} - 売却費用 {yen(r['sale_cost'])} - ローン残債 {yen(r['loan_balance'])} - 譲渡所得税 {yen(r['capital_gain_tax'])}",
+    )
+    formula_line(
+        "譲渡所得",
+        r["capital_gain"],
+        f"= 売却価格 {yen(i.sale_price)} - 取得費 {yen(r['acquisition_cost'])} - 売却費用 {yen(r['sale_cost'])}",
+    )
+    formula_line(
+        "取得費",
+        r["acquisition_cost"],
+        f"= 土地簿価 {yen(r['land_price'])} + 建物簿価 {yen(r['building_book_value'])}",
+    )
+    formula_line(
+        "建物簿価",
+        r["building_book_value"],
+        f"= 建物価格 {yen(r['building_price'])} - 累計減価償却 {yen(r['cumulative_depreciation'])}",
+    )
+    formula_line(
+        "固定資産税・都市計画税/年",
+        i.property_city_tax_yearly,
+        f"= 購入価格 {yen(i.purchase_price)} × 評価額割合 {i.assessment_ratio:.1f}% × 1.7%",
+    )
+    formula_line(
+        "初期持ち出し",
+        r["initial_cash_out"],
+        f"= 頭金 {yen(i.down_payment)} + 購入諸費用 {yen(r['purchase_cost'])}",
+    )
 
 
 def extract_pdf_text(uploaded_file) -> str:
